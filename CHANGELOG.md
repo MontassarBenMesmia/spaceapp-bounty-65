@@ -11,6 +11,8 @@ Semantic Versioning.
   reload, isolated PostgreSQL and Temporal services, normal owner setup, and an
   OpenCode terminal. Includes stop, rebuild and reset commands, platform notes,
   and real-service CI acceptance.
+- Contributor Node pin updated to the 22.23.4 security release, matching the
+  Docker build's Node patch version.
 
 ## [1.1.9] - 2026-10-25
 
