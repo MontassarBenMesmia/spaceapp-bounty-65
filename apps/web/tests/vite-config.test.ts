@@ -1,9 +1,13 @@
 // @vitest-environment node
 
 import { describe, expect, it } from "vitest";
-import { manualChunkForModule } from "../vite.config.js";
+import config, { manualChunkForModule } from "../vite.config.js";
 
 describe("web bundle chunk policy", () => {
+  it("proxies terminal WebSockets to the configured API origin", () => {
+    const proxy = config.server?.proxy?.["/api"];
+    expect(proxy).toEqual({ target: process.env.SPACE_API_ORIGIN ?? "http://127.0.0.1:4910", ws: true });
+  });
   it("isolates React and xterm while leaving feature modules available for lazy chunks", () => {
     expect(manualChunkForModule("/workspace/node_modules/react-dom/client.js")).toBe("vendor-react");
     expect(manualChunkForModule("/workspace/node_modules/react/jsx-runtime.js")).toBe("vendor-react");

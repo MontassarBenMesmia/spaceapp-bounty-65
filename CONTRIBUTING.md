@@ -71,6 +71,101 @@ exit, and check cleanup after both. Restore the intended behavior before
 submitting a change. Use the tests for the affected workspace as well; the
 offline smoke is not a substitute for them.
 
+## Run the complete stack from source
+
+Use Node 22.12 or newer within Node 22, npm, Python 3, make and a C++ compiler
+(`build-essential` on Ubuntu; Xcode Command Line Tools on macOS). Start Docker
+with Compose v2 first. On macOS, Docker Desktop or a running Colima Docker context
+works; the runner preserves the Docker CLI's configured context for Docker commands
+only. On Windows 11, use WSL2 with Docker Desktop's WSL integration and a checkout
+in the Linux filesystem, for example `~/src/spaceapp`, rather than `/mnt/c`.
+Restrictive Unix permissions and Unix sockets are required. Keep checkout paths
+short enough that `.dev-stack/control.sock` is below 100 bytes.
+
+```sh
+ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm ci
+npm run dev:stack
+```
+
+The first start builds internal packages, installs the **exact** OpenCode version
+declared in the Dockerfile under `.dev-stack/vendor`, and pulls the digest-pinned
+PostgreSQL/pgvector and Temporal images from the maintained launcher Compose
+template. It can take several minutes and needs internet access. The command
+remains in the foreground and prints the web URL and a one-time owner setup token.
+Open that URL, claim the installation with the token, choose your email/password,
+then sign in normally. The token expires 15 minutes after API startup; restart
+to issue a fresh expiry if needed. There is no dev-login bypass. Open **Getting
+Started**, add an OpenCode terminal pane, and reach its real TUI. No paid provider
+account is needed to open the TUI; running a model may need a provider account.
+
+```sh
+npm run dev:stack -- status
+npm run dev:stack -- down
+npm run dev:stack -- reset
+```
+
+Ctrl+C and `down` stop supervised source processes and this checkout's containers,
+preserving its database and settings. `reset` additionally removes this checkout's
+Compose containers, named volume, and `.dev-stack/` directory. It never targets an
+installed SpaceApp, other Compose projects, or global provider settings. The state
+directory is private (0700), secrets are created with 0600 permissions, and all
+provider HOME/XDG directories and wrappers are local to it. Only the bootstrap
+token is intentionally printed. Logs are in `.dev-stack/logs/`; review/redact them
+before sharing, as application output can contain private task data.
+
+Default listeners bind to **127.0.0.1**:
+
+| Service | Port | Override |
+| --- | --- | --- |
+| Web/Vite | 14911 | `SPACE_DEV_WEB_PORT` |
+| API | 14910 | `SPACE_DEV_API_PORT` |
+| PostgreSQL | 15432 | `SPACE_DEV_POSTGRES_PORT` |
+| Temporal | 17233 | `SPACE_DEV_TEMPORAL_PORT` |
+| State-local OpenCode server | 14096 | `SPACE_DEV_OPENCODE_PORT` |
+
+Set overrides on the start command, for example
+`SPACE_DEV_WEB_PORT=15911 SPACE_DEV_API_PORT=15910 npm run dev:stack`.
+Choose distinct unprivileged ports; installed-stack ports 4910/4911/5432/7233 are
+rejected. Use the same settings on subsequent starts. Docker Engine 28 or newer is
+recommended: older engines have a documented localhost-published-port caveat on
+the same L2 network. Loopback configuration alone cannot establish network isolation
+on those engines. See [Docker's port publishing documentation](https://docs.docker.com/engine/network/port-publishing/).
+
+API source edits restart through `tsx watch`; web edits use Vite HMR, including the
+terminal WebSocket proxy. After editing internal `packages/*` or worker code, run
+`npm run dev:stack -- rebuild` in another terminal. It stops the existing stack,
+rebuilds internal packages and worker, then runs the stack in that terminal's
+foreground, preserving your database and settings. Optional browser/Chromium, root shell, companion applications,
+Telegram jobs and provider integration setup are outside this contributor stack.
+Workflows stay enabled; `/readyz` must report a running Temporal worker and CLI
+host. A supervised child failure stops the stack with an explicit error.
+
+If startup fails, inspect the named log file and fix the reported missing tool,
+port collision, dependency build or Docker error. Start Docker before retrying.
+If the runner was killed forcibly and `.dev-stack/running.lock` remains, first
+verify its old processes have stopped; the runner deliberately does not kill
+unverified PIDs from a stale file. Remove only that stale lock after verification,
+then run `reset`. A copied checkout's ownership marker is rejected; never copy
+runtime `.dev-stack` state between checkouts. Do not relax state permissions to
+work around a Windows mount: move the checkout to the WSL Linux filesystem.
+
+For the destructive, real-service acceptance check, explicitly reset your **dev**
+state first (it requires a fresh installation):
+
+```sh
+npm run test:dev-stack
+npm run dev:stack -- reset
+npm run dev:stack:smoke
+```
+
+The acceptance script boots the real stack without a TTY, claims an owner over
+HTTP, signs in with the new password, opens Getting Started, creates an OpenCode
+pane and checks real TUI output through Vite's WebSocket proxy. Finally it resets
+owned resources and checks for remaining containers, volumes and listeners. It
+does not perform model inference. The Linux CI job runs this flow. Platform claims
+in a contribution must be backed by actual Linux and macOS or WSL2 runs, alongside
+the repository's required check/test/build/hygiene gates below.
+
 ## Checks before a commit
 
 After `npm ci`, these commands work in this order, also on a fresh clone:
