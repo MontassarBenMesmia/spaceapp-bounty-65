@@ -5,6 +5,13 @@ Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `npm run dev:stack` runs the contributor application from source with API/web hot
+  reload, isolated PostgreSQL and Temporal services, normal owner setup, and an
+  OpenCode terminal. Includes stop, rebuild and reset commands, platform notes,
+  and real-service CI acceptance.
+
 ## [1.1.9] - 2026-10-25
 
 Source: sanitized Space app @ 25bcec3e77 (5029 files). 1.1.8 was prepared but never published; its changes are part of
