@@ -109,6 +109,8 @@ Ctrl+C and `down` stop supervised source processes and this checkout's container
 preserving its database and settings. `reset` additionally removes this checkout's
 Compose containers, named volume, and `.dev-stack/` directory. It never targets an
 installed SpaceApp, other Compose projects, or global provider settings. The state
+marker includes a random project ID, so identical checkout paths in separate WSL
+distributions sharing Docker Desktop still use different Compose projects. The state
 directory is private (0700), secrets are created with 0600 permissions, and all
 provider HOME/XDG directories and wrappers are local to it. Only the bootstrap
 token is intentionally printed. Logs are in `.dev-stack/logs/`; review/redact them

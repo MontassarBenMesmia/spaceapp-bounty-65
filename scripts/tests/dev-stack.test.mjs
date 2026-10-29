@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { afterEach, test } from "node:test";
 import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import os from "node:os";
 import path from "node:path";
-import { childEnvironment, composeConfiguration, ensurePrivateDirectory, loadConfig, portsFromEnvironment, privateFile, sourcePins } from "../dev-stack-config.mjs";
+import { childEnvironment, composeConfiguration, ensurePrivateDirectory, loadConfig, portsFromEnvironment, privateFile, projectForState, sourcePins } from "../dev-stack-config.mjs";
 import { installedOpenCodeExecutable, matchesOpenCodeVersion, providerEnvironment } from "../dev-stack-opencode.mjs";
 import { ownedProcessIds, ProcessSupervisor, stackReady, waitUntil } from "../dev-stack-processes.mjs";
 import { acquireStateLock, releaseStateLock, removeLockedState, requestControl, unlinkOwnedSocket } from "../dev-stack-control.mjs";
@@ -81,8 +82,41 @@ test("state ownership rejects symlink escape and a copied checkout marker", { sk
   await assert.rejects(loadConfig(dir), /private real directory/);
   await rm(path.join(dir, ".dev-stack"));
   await mkdir(path.join(dir, ".dev-stack"), { mode: 0o700 });
-  await writeFile(path.join(dir, ".dev-stack", "owner.json"), JSON.stringify({ root: "/another-checkout" }), { mode: 0o600 });
+  await writeFile(path.join(dir, ".dev-stack", "owner.json"), JSON.stringify({ version: 2, root: "/another-checkout", stateId: "a".repeat(24) }), { mode: 0o600 });
   await assert.rejects(loadConfig(dir), /ownership/);
+});
+
+test("identical checkout paths in independent states have different Docker projects", () => {
+  const root = path.resolve("/home/contributor/spaceapp");
+  const first = projectForState(root, "a".repeat(24));
+  const second = projectForState(root, "b".repeat(24));
+  assert.notEqual(first, second);
+  assert.match(first, /^spaceapp-dev-[a-f0-9]{12}-[a-f0-9]{24}$/);
+  for (const invalid of [undefined, "", "../other-project", "a".repeat(23), "g".repeat(24), `${"a".repeat(24)}\n`]) {
+    assert.throws(() => projectForState(root, invalid), /ownership ID/);
+  }
+});
+
+test("private ownership reloads preserve project identity while fresh state gets a new identity", { skip: process.platform === "win32" }, async () => {
+  const root = await temp();
+  await mkdir(path.join(root, "packages/run-spaceapp/templates"), { recursive: true });
+  await writeFile(path.join(root, "packages/run-spaceapp/templates/compose.yml"), await readFile(new URL("../../packages/run-spaceapp/templates/compose.yml", import.meta.url)));
+  await writeFile(path.join(root, "Dockerfile"), await readFile(new URL("../../Dockerfile", import.meta.url)));
+  const first = await loadConfig(root);
+  const reloaded = await loadConfig(root, {}, false);
+  assert.equal(first.project, reloaded.project);
+  assert.equal(first.stateId, reloaded.stateId);
+  assert.equal((await lstat(path.join(first.state, "owner.json"))).mode & 0o777, 0o600);
+  const markerPath = path.join(first.state, "owner.json");
+  const marker = JSON.parse(await readFile(markerPath, "utf8"));
+  await writeFile(markerPath, JSON.stringify({ ...marker, project: "neighbor-project" }));
+  await assert.rejects(loadConfig(root, {}, false), /ownership/);
+  await writeFile(markerPath, JSON.stringify({ ...marker, stateId: "invalid" }));
+  await assert.rejects(loadConfig(root, {}, false), /ownership ID/);
+  await rm(first.state, { recursive: true });
+  const fresh = await loadConfig(root);
+  assert.notEqual(first.stateId, fresh.stateId);
+  assert.notEqual(first.project, fresh.project);
 });
 
 test("nested provider directories cannot escape through a symlink", { skip: process.platform === "win32" }, async () => {
@@ -242,4 +276,34 @@ test("reset removes owned state while preserving a successor when old ownership 
   assert.equal(await readFile(path.join(state, "successor-data"), "utf8"), "preserve");
   await removeLockedState(config, successor);
   await assert.rejects(lstat(state), error => error.code === "ENOENT");
+});
+
+test("a port conflict before Compose startup does not invoke Docker cleanup", { skip: process.platform === "win32" }, async () => {
+  const root = await temp();
+  await mkdir(path.join(root, "scripts"));
+  await mkdir(path.join(root, "packages/run-spaceapp/templates"), { recursive: true });
+  await mkdir(path.join(root, "bin"));
+  for (const name of ["dev-stack.mjs", "dev-stack-config.mjs", "dev-stack-control.mjs", "dev-stack-processes.mjs", "dev-stack-opencode.mjs"]) {
+    await writeFile(path.join(root, "scripts", name), await readFile(new URL(`../${name}`, import.meta.url)));
+  }
+  await writeFile(path.join(root, "packages/run-spaceapp/templates/compose.yml"), await readFile(new URL("../../packages/run-spaceapp/templates/compose.yml", import.meta.url)));
+  await writeFile(path.join(root, "Dockerfile"), await readFile(new URL("../../Dockerfile", import.meta.url)));
+  const called = path.join(root, "docker-was-called");
+  const fakeDocker = path.join(root, "bin", "docker");
+  await writeFile(fakeDocker, `#!${process.execPath}\nrequire("node:fs").writeFileSync(${JSON.stringify(called)}, "called");\n`, { mode: 0o700 });
+  const listener = createServer();
+  await new Promise(resolve => listener.listen(0, "127.0.0.1", resolve));
+  const child = spawn(process.execPath, [path.join(root, "scripts", "dev-stack.mjs")], {
+    cwd: root, shell: false, env: { PATH: `${path.join(root, "bin")}:${process.env.PATH}`, SPACE_DEV_API_PORT: String(listener.address().port) }, stdio: ["ignore", "ignore", "pipe"]
+  });
+  let stderr = "";
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  const timer = setTimeout(() => child.kill("SIGKILL"), 10000);
+  try {
+    const code = await new Promise((resolve, reject) => { child.once("exit", resolve); child.once("error", reject); });
+    assert.equal(code, 1);
+    assert.match(stderr, /port .* is in use/);
+    await assert.rejects(lstat(called), error => error.code === "ENOENT");
+    await assert.rejects(lstat(path.join(root, ".dev-stack", "running.lock")), error => error.code === "ENOENT");
+  } finally { clearTimeout(timer); await new Promise(resolve => listener.close(resolve)); }
 });

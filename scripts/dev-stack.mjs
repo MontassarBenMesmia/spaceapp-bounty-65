@@ -78,12 +78,15 @@ async function main() {
   let server;
   let socketIdentity;
   let stopped = false;
+  let composeUpAttempted = false;
   let cleanupPromise;
   const cleanup = () => cleanupPromise ??= (async () => {
     stopped = true;
     await supervisor.stop();
-    const cleanupSupervisor = new ProcessSupervisor(config, supervisor.env);
-    await cleanupSupervisor.run("docker-stop", "docker", [...composeArgs, "stop", "--timeout", "10"], { env: dockerEnvironment(supervisor.env) });
+    if (composeUpAttempted) {
+      const cleanupSupervisor = new ProcessSupervisor(config, supervisor.env);
+      await cleanupSupervisor.run("docker-stop", "docker", [...composeArgs, "stop", "--timeout", "10"], { env: dockerEnvironment(supervisor.env) });
+    }
   })();
   for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, () => { void cleanup().catch(error => { console.error(error.message); process.exitCode = 1; }); });
   try {
@@ -136,6 +139,7 @@ async function main() {
     const wrapper = `#!${process.execPath}\nimport { runOpenCode } from ${JSON.stringify(new URL("./dev-stack-opencode.mjs", import.meta.url).href)};\nawait runOpenCode(${JSON.stringify(config.state)}, ${config.ports.opencode}, process.argv.slice(2));\n`;
     await writeOwned(path.join(config.state, "bin", "opencode-vscode-parity"), wrapper, 0o700);
     console.log("Starting checkout-owned PostgreSQL and Temporal...");
+    composeUpAttempted = true;
     await supervisor.run("docker-up", "docker", [...composeArgs, "up", "--detach", "--wait", "--wait-timeout", "240"], { env: dockerEnvironment(supervisor.env) });
     await supervisor.run("temporal-namespace", "docker", [...composeArgs, "exec", "-T", "temporal", "temporal", "operator", "namespace", "describe", "--namespace", "spaceapp-dev", "--address", "temporal:7233"], { env: dockerEnvironment(supervisor.env) }).catch(async () => {
       await supervisor.run("temporal-create-namespace", "docker", [...composeArgs, "exec", "-T", "temporal", "temporal", "operator", "namespace", "create", "--namespace", "spaceapp-dev", "--address", "temporal:7233"], { env: dockerEnvironment(supervisor.env) });

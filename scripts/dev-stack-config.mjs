@@ -6,6 +6,12 @@ import os from "node:os";
 
 export const portDefaults = { api: 14910, web: 14911, postgres: 15432, temporal: 17233, opencode: 14096 };
 
+export function projectForState(root, stateId) {
+  if (typeof stateId !== "string" || !/^[a-f0-9]{24}$/.test(stateId)) throw new Error("Invalid development state ownership ID");
+  const identity = createHash("sha256").update(root).digest("hex").slice(0, 12);
+  return `spaceapp-dev-${identity}-${stateId}`;
+}
+
 export function portsFromEnvironment(env) {
   const ports = Object.fromEntries(Object.entries(portDefaults).map(([name, fallback]) => {
     const value = env[`SPACE_DEV_${name.toUpperCase()}_PORT`] ?? String(fallback);
@@ -64,15 +70,17 @@ export async function loadConfig(root, env = process.env, create = true) {
     throw new Error(".dev-stack must be an owned, private real directory (use a Linux filesystem under WSL2)");
   }
   const identity = createHash("sha256").update(root).digest("hex").slice(0, 12);
-  const expected = JSON.stringify({ version: 1, root, project: `spaceapp-dev-${identity}` });
   const marker = path.join(state, "owner.json");
-  const recorded = create ? await privateFile(marker, () => expected) : await readPrivateFile(marker);
+  const recorded = create ? await privateFile(marker, () => JSON.stringify({ version: 2, root, stateId: randomBytes(12).toString("hex") })) : await readPrivateFile(marker);
   const markerInfo = await lstat(marker);
   if (!markerInfo.isFile() || markerInfo.isSymbolicLink() || (markerInfo.mode & 0o077)) throw new Error("Unsafe state ownership marker");
-  if (recorded !== expected) throw new Error("State ownership does not match this checkout; refusing cleanup");
+  let owner;
+  try { owner = JSON.parse(recorded); } catch { throw new Error("Invalid development state ownership marker"); }
+  if (!owner || owner.version !== 2 || owner.root !== root || Object.keys(owner).sort().join(",") !== "root,stateId,version") throw new Error("State ownership does not match this checkout; refusing cleanup");
+  const project = projectForState(root, owner.stateId);
   const pins = sourcePins(await readFile(path.join(root, "packages/run-spaceapp/templates/compose.yml"), "utf8"), await readFile(path.join(root, "Dockerfile"), "utf8"));
   const ports = portsFromEnvironment(env);
-  return { root, state, identity, project: `spaceapp-dev-${identity}`, pins, ports, socket: path.join(state, "control.sock") };
+  return { root, state, identity, stateId: owner.stateId, project, pins, ports, socket: path.join(state, "control.sock") };
 }
 
 export async function initialize(config) {
