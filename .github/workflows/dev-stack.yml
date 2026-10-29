@@ -1,38 +1,35 @@
-name: Source development stack
-
+name: Fork-only public quality verification
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
-
 permissions:
   contents: read
-
-concurrency:
-  group: dev-stack-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  real-stack:
+  quality:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 75
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version-file: .nvmrc
           cache: npm
-      - name: Install native build prerequisites
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential python3
-      - run: npm ci
-      - run: npm run test:dev-stack
-      - name: Real owner setup and OpenCode PTY acceptance (no TTY)
-        run: npm run dev:stack:smoke
-      - name: Always clean checkout-owned stack
-        if: always()
-        run: npm run dev:stack -- reset
+      - name: Install test prerequisites
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential python3 ripgrep ffmpeg sqlite3
+      - name: Create sanitized public candidate
+        run: node scripts/public-export.mjs --output "$RUNNER_TEMP/spaceapp-public-export"
+      - name: Install locked dependencies
+        working-directory: ${{ runner.temp }}/spaceapp-public-export
+        run: npm ci
+      - name: Check architecture and types
+        working-directory: ${{ runner.temp }}/spaceapp-public-export
+        run: npm run check
+      - name: Run full public suite
+        working-directory: ${{ runner.temp }}/spaceapp-public-export
+        run: npm test
+      - name: Build production applications
+        working-directory: ${{ runner.temp }}/spaceapp-public-export
+        run: npm run build
