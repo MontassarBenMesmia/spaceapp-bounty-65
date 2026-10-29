@@ -17,10 +17,41 @@ const runner = path.join(root, "scripts", "dev-stack.mjs");
 const ports = portsFromEnvironment(process.env);
 const origin = `http://127.0.0.1:${ports.web}`;
 let stack;
-let stackClosed = false;
 let cookie;
 let csrf;
 let config;
+
+function startRunner(args = []) {
+  const child = spawn(process.execPath, [runner, ...args], { cwd: root, env: process.env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+  child.runnerClosed = false;
+  child.once("error", error => { child.runnerFailure = error; });
+  child.once("exit", code => { child.runnerFailure = new Error(`Development runner exited ${code}`); });
+  child.once("close", () => { child.runnerClosed = true; });
+  child.stdout.resume(); // Never echo the one-time owner setup token into CI output.
+  child.stderr.on("data", chunk => process.stderr.write(chunk));
+  return child;
+}
+
+async function waitForRunnerClose(child) {
+  if (child.runnerClosed) return;
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Previous supervisor did not finish shutdown")), 60000);
+    child.once("close", () => { clearTimeout(timer); resolve(); });
+  });
+}
+
+async function waitForReadyStack() {
+  const deadline = Date.now() + 12 * 60000;
+  while (Date.now() < deadline) {
+    if (stack.runnerFailure) throw stack.runnerFailure;
+    try {
+      const ready = await request("/readyz", undefined, false);
+      if (ready.ok) return ready;
+    } catch { /* startup */ }
+    await delay(1000);
+  }
+  throw new Error("Real stack did not become ready before the acceptance deadline");
+}
 
 async function command(args) {
   return new Promise((resolve, reject) => {
@@ -79,22 +110,9 @@ async function portIsClosed(port) {
 async function main() {
   try { await access(path.join(root, ".dev-stack")); throw new Error("Acceptance requires fresh state; explicitly reset your development stack before running this test"); }
   catch (error) { if (error.code !== "ENOENT") throw error; }
-  stack = spawn(process.execPath, [runner], { cwd: root, env: process.env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
-  let failure;
-  stack.once("error", error => { failure = error; });
-  stack.once("exit", code => { failure = new Error(`Development runner exited ${code}`); });
-  stack.once("close", () => { stackClosed = true; });
-  // Drain without echoing the one-time setup token into CI output.
-  stack.stdout.resume();
-  stack.stderr.on("data", chunk => process.stderr.write(chunk));
+  stack = startRunner();
   try {
-    const deadline = Date.now() + 12 * 60000;
-    let ready;
-    while (Date.now() < deadline) {
-      if (failure) throw failure;
-      try { ready = await request("/readyz", undefined, false); if (ready.ok) break; } catch { /* startup */ }
-      await delay(1000);
-    }
+    const ready = await waitForReadyStack();
     assert.equal(ready?.ok, true, "Real stack must become ready");
     assert.equal(ready.dependencies.database, "RUNNING");
     assert.equal(ready.dependencies.worker, "RUNNING");
@@ -119,9 +137,21 @@ async function main() {
     const running = await request(`/api/panes/${pane.id}/cli/session`);
     assert.equal(running.session.status, "RUNNING");
     console.log("PASS: PostgreSQL, Temporal worker, normal owner claim/sign-in, Getting Started room, source CLI host, real OpenCode TUI via Vite WebSocket proxy.");
+    const previous = stack;
+    stack = startRunner(["rebuild"]);
+    await waitForRunnerClose(previous);
+    const rebuilt = await waitForReadyStack();
+    assert.notEqual(rebuilt.apiStartedAt, ready.apiStartedAt, "Rebuild must start a fresh source API");
+    await command([process.execPath, runner, "status"]);
+    cookie = undefined;
+    csrf = undefined;
+    const relogin = await request("/api/auth/login", { email, password }, false);
+    assert.equal(relogin.user.email, email);
+    assert.ok(cookie);
+    console.log("PASS: real rebuild completed shutdown, rebuilt source packages, retained its control socket and preserved owner credentials.");
   } finally {
     await command([process.execPath, runner, "reset"]);
-    if (!stackClosed) await new Promise(resolve => stack.once("close", resolve));
+    await waitForRunnerClose(stack);
     await assert.rejects(access(path.join(root, ".dev-stack")), error => error.code === "ENOENT");
     if (config) {
       const filter = `label=com.docker.compose.project=${config.project}`;

@@ -168,6 +168,9 @@ the repository's required check/test/build/hygiene gates below.
 
 ## Checks before a commit
 
+Run the full test suite as a regular user, with `rg` (ripgrep), `ffmpeg`, and
+`sqlite3` on PATH. Permission fixtures depend on normal Unix access checks.
+
 After `npm ci`, these commands work in this order, also on a fresh clone:
 
 ```sh

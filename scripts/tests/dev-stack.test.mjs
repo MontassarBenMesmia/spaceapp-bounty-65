@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
+import { setTimeout as delay } from "node:timers/promises";
 import os from "node:os";
 import path from "node:path";
 import { childEnvironment, composeConfiguration, ensurePrivateDirectory, loadConfig, portsFromEnvironment, privateFile, sourcePins } from "../dev-stack-config.mjs";
 import { installedOpenCodeExecutable, matchesOpenCodeVersion, providerEnvironment } from "../dev-stack-opencode.mjs";
 import { ownedProcessIds, ProcessSupervisor, stackReady, waitUntil } from "../dev-stack-processes.mjs";
+import { acquireStateLock, releaseStateLock, removeLockedState, requestControl, unlinkOwnedSocket } from "../dev-stack-control.mjs";
 
 const temporary = [];
 afterEach(async () => { for (const dir of temporary.splice(0)) await rm(dir, { recursive: true, force: true }); });
@@ -186,4 +189,57 @@ test("leftover process inspection matches exact state, including socket-only chi
     await symlink(cwd, path.join(directory, "cwd"));
   }
   assert.deepEqual(await ownedProcessIds(state, proc), [101, 102, 103]);
+});
+
+test("down waits for complete Unix control shutdown before a successor can start", { skip: process.platform === "win32" }, async () => {
+  const state = await temp();
+  await mkdir(path.join(state, "secrets"), { mode: 0o700 });
+  const config = { state, socket: path.join(state, "control.sock") };
+  const token = await privateFile(path.join(state, "secrets", "control"), () => "private-control-token");
+  const lock = await acquireStateLock(config);
+  const server = createServer({ allowHalfOpen: true }, socket => {
+    socket.once("data", data => {
+      const request = JSON.parse(data.toString());
+      assert.equal(request.token, token);
+      assert.equal(request.action, "down");
+      socket.end(JSON.stringify({ ok: true, generation: lock.generation }));
+    });
+  });
+  await new Promise(resolve => server.listen(config.socket, resolve));
+  await chmod(config.socket, 0o600);
+  const identity = await lstat(config.socket);
+  let downCompleted = false;
+  const down = requestControl(config, "down").then(() => { downCompleted = true; });
+  await delay(75);
+  assert.equal(downCompleted, false, "Acknowledgement alone must not let rebuild race the old finalizer");
+  await assert.rejects(acquireStateLock(config), /already owns/);
+  await new Promise(resolve => server.close(resolve));
+  await unlinkOwnedSocket(config.socket, identity, lock);
+  await releaseStateLock(lock);
+  await down;
+  const successor = await acquireStateLock(config);
+  const successorServer = createServer();
+  try {
+    await new Promise(resolve => successorServer.listen(config.socket, resolve));
+    await chmod(config.socket, 0o600);
+    assert.equal(await releaseStateLock(lock), false, "Old finalization must not remove a successor lock");
+    assert.equal(await unlinkOwnedSocket(config.socket, identity, lock), false, "Old finalization must not remove a successor socket");
+    assert.equal((await lstat(config.socket)).isSocket(), true);
+  } finally {
+    await new Promise(resolve => successorServer.close(resolve));
+    await releaseStateLock(successor);
+  }
+});
+
+test("reset removes owned state while preserving a successor when old ownership is stale", { skip: process.platform === "win32" }, async () => {
+  const state = await temp();
+  const config = { state };
+  const old = await acquireStateLock(config);
+  await releaseStateLock(old);
+  const successor = await acquireStateLock(config);
+  await writeFile(path.join(state, "successor-data"), "preserve");
+  await assert.rejects(removeLockedState(config, old), /lost its state ownership/);
+  assert.equal(await readFile(path.join(state, "successor-data"), "utf8"), "preserve");
+  await removeLockedState(config, successor);
+  await assert.rejects(lstat(state), error => error.code === "ENOENT");
 });

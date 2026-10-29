@@ -1,13 +1,14 @@
 #!/usr/bin/env node
-import { createServer, createConnection } from "node:net";
+import { createServer } from "node:net";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, rm, unlink } from "node:fs/promises";
+import { chmod, lstat, open, readFile, rm, unlink } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { childEnvironment, composeConfiguration, dockerEnvironment, ensurePrivateDirectory, initialize, loadConfig, readPrivateFile } from "./dev-stack-config.mjs";
+import { childEnvironment, composeConfiguration, dockerEnvironment, ensurePrivateDirectory, initialize, loadConfig } from "./dev-stack-config.mjs";
 import { healthyHttp, ProcessSupervisor, stackReady, waitUntil } from "./dev-stack-processes.mjs";
 import { installedOpenCodeExecutable, matchesOpenCodeVersion, providerEnvironment } from "./dev-stack-opencode.mjs";
+import { acquireStateLock, releaseStateLock, removeLockedState, requestControl as control, unlinkOwnedSocket } from "./dev-stack-control.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 let command = process.argv[2] ?? "up";
@@ -21,23 +22,6 @@ async function writeOwned(filename, content, mode = 0o600) {
   const handle = await open(filename, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, mode);
   try { await handle.writeFile(content); } finally { await handle.close(); }
   await chmod(filename, mode);
-}
-
-async function control(config, action) {
-  const token = await readPrivateFile(path.join(config.state, "secrets", "control"));
-  const socketInfo = await lstat(config.socket);
-  if (!socketInfo.isSocket() || (socketInfo.mode & 0o077) || (process.getuid && socketInfo.uid !== process.getuid())) throw new Error("Unsafe supervisor control socket");
-  return new Promise((resolve, reject) => {
-    const socket = createConnection(config.socket);
-    let received = "";
-    socket.setTimeout(60000, () => socket.destroy(new Error("Supervisor did not respond")));
-    socket.once("connect", () => socket.end(`${JSON.stringify({ token, action })}\n`));
-    socket.on("data", chunk => { received += chunk; if (received.length > 4096) socket.destroy(new Error("Invalid supervisor response")); });
-    socket.once("error", reject);
-    socket.once("end", () => {
-      try { const response = JSON.parse(received); response.ok ? resolve(response) : reject(new Error(response.error)); } catch (error) { reject(error); }
-    });
-  });
 }
 
 async function assertFreePorts(ports) {
@@ -72,23 +56,27 @@ async function main() {
   if (command === "reset") {
     try { await control(config, "down"); }
     catch (error) { if (!["ENOENT", "ECONNREFUSED"].includes(error.code)) throw error; }
-    // A stale lock requires explicit recovery: never infer process ownership from a PID file.
-    try { await lstat(path.join(config.state, "running.lock")); throw new Error("A supervisor lock remains; verify the old runner and its children are stopped before removing .dev-stack/running.lock"); }
-    catch (error) { if (error.code !== "ENOENT") throw error; }
-    const secrets = await initialize(config);
-    const supervisor = new ProcessSupervisor(config, childEnvironment(config, secrets));
-    await writeOwned(path.join(config.state, "compose.json"), `${JSON.stringify(composeConfiguration(config), null, 2)}\n`);
-    await supervisor.run("reset", "docker", ["compose", "-p", config.project, "-f", path.join(config.state, "compose.json"), "down", "--volumes", "--remove-orphans"], { env: dockerEnvironment(supervisor.env) });
-    await rm(config.state, { recursive: true });
+    // Reset owns the same exclusive lock as startup, so another command cannot start during deletion.
+    const resetLock = await acquireStateLock(config);
+    try {
+      const secrets = await initialize(config);
+      const supervisor = new ProcessSupervisor(config, childEnvironment(config, secrets));
+      await writeOwned(path.join(config.state, "compose.json"), `${JSON.stringify(composeConfiguration(config), null, 2)}\n`);
+      await supervisor.run("reset", "docker", ["compose", "-p", config.project, "-f", path.join(config.state, "compose.json"), "down", "--volumes", "--remove-orphans"], { env: dockerEnvironment(supervisor.env) });
+      await removeLockedState(config, resetLock);
+    } finally { await releaseStateLock(resetLock); }
     console.log("Removed only this checkout's development containers, volumes, and state.");
     return;
   }
 
-  const secrets = await initialize(config);
-  await mkdir(path.join(config.state, "running.lock"), { mode: 0o700 }).catch(error => { if (error.code === "EEXIST") throw new Error("A development stack already owns this state (or its lock needs manual recovery); try status/down first"); throw error; });
+  const lock = await acquireStateLock(config);
+  let secrets;
+  try { secrets = await initialize(config); }
+  catch (error) { await releaseStateLock(lock); throw error; }
   const supervisor = new ProcessSupervisor(config, childEnvironment(config, secrets));
   const composeArgs = ["compose", "-p", config.project, "-f", path.join(config.state, "compose.json")];
   let server;
+  let socketIdentity;
   let stopped = false;
   let cleanupPromise;
   const cleanup = () => cleanupPromise ??= (async () => {
@@ -96,7 +84,6 @@ async function main() {
     await supervisor.stop();
     const cleanupSupervisor = new ProcessSupervisor(config, supervisor.env);
     await cleanupSupervisor.run("docker-stop", "docker", [...composeArgs, "stop", "--timeout", "10"], { env: dockerEnvironment(supervisor.env) });
-    await rm(path.join(config.state, "running.lock"), { recursive: true });
   })();
   for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, () => { void cleanup().catch(error => { console.error(error.message); process.exitCode = 1; }); });
   try {
@@ -115,13 +102,14 @@ async function main() {
           const request = JSON.parse(received);
           if (request.token !== secrets.control || !["down", "status"].includes(request.action)) throw new Error("Invalid control request");
           if (request.action === "down") await cleanup();
-          socket.end(JSON.stringify({ ok: true }));
+          socket.end(JSON.stringify({ ok: true, generation: lock.generation }));
         })().catch(error => socket.end(JSON.stringify({ ok: false, error: error.message })));
       });
       socket.on("error", () => {});
     });
     await new Promise((resolve, reject) => { server.once("error", reject); server.listen(config.socket, resolve); });
     await chmod(config.socket, 0o600);
+    socketIdentity = await lstat(config.socket);
     console.log("Building workspace dependencies (first startup can take several minutes)...");
     for (const name of sharedPackages) await supervisor.run(`build-${name}`, "npm", ["run", "build", "-w", `@space/${name}`]);
     await supervisor.run("build-worker", "npm", ["run", "build", "-w", "@space/worker"]);
@@ -167,9 +155,13 @@ async function main() {
     console.log(`SpaceApp source stack: http://127.0.0.1:${config.ports.web}\nOne-time owner setup token: ${secrets.setup}\nToken expires 15 minutes after API startup. Stop: npm run dev:stack -- down`);
     while (!stopped) { supervisor.assertHealthy(); await delay(300); }
   } finally {
-    try { await cleanup(); } finally {
-      if (server) await new Promise(resolve => server.close(resolve));
-      try { await unlink(config.socket); } catch (error) { if (error.code !== "ENOENT") throw error; }
+    let clean = false;
+    try { await cleanup(); clean = true; } finally {
+      // No successor may acquire the lock until this server and its pathname are gone.
+      // Inode and generation checks also protect a successor if the old lock was manually replaced.
+      if (server?.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      if (socketIdentity) await unlinkOwnedSocket(config.socket, socketIdentity, lock);
+      if (clean) await releaseStateLock(lock);
     }
   }
 }
